@@ -1,0 +1,12 @@
+# Exclude data folder (large files)
+data/
+
+# R project files
+.Rproj.user/
+.RData
+.Rhistory
+
+# Other common exclusions
+*.log
+*.tmp
+*~
