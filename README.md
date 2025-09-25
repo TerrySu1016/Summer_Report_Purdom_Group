@@ -78,7 +78,8 @@ Summer_Report_Archive/
 │       ├── 6-20k/            # GMM parameters for samples (k=6-20 range).
 │       ├── defaultGMM_1-9k_distMat.rds    # Distance matrix (baseline)
 │       ├── defaultGMM_6-20k_distMat.rds   # Distance matrix (expanded)
-│       └── gmm_fitted_models_6-20k.rds    # Fitted GMM models
+│       ├── gmm_fitted_models_1-9k.rds   # Fitted GMM models (Default)
+│       └── gmm_fitted_models_6-20k.rds    # Fitted GMM models (Expand)
 │
 └── final_report/             # Output directory (created during knitting).
     └── (analysis outputs)    # All generated plots and data files.
