@@ -1,0 +1,699 @@
+---
+title: "A Diagnostic Analysis for Gaussian Mixture Models in Single-Cell Population Analysis"
+author: "Quanjin (Terry) Su, Purdom Group, UC Berkeley"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: united
+    code_folding: hide
+    fig_width: 10
+    fig_height: 8
+---
+
+```{r setup, include=FALSE}
+# This chunk sets up global options for the document.
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, 
+                      fig.align = "center", fig.show = "hold")
+library(here)
+library(ggplot2)
+library(dplyr)
+library(GloScope)
+library(pheatmap)
+library(viridis)
+library(gridExtra)
+library(Seurat)
+library(RColorBrewer)
+
+# Source utility functions
+source(here::here("code", "utils", "util_visualize_gloscope.r"))
+source(here::here("code", "utils", "util_bic_visualization.r"))
+source(here::here("code", "utils", "util_unified_condition_heatmaps.r"))
+source(here::here("code", "utils", "util_multi_patient_visualization.r"))
+```
+
+# Introduction
+
+Single-cell RNA sequencing allows for the analysis of gene expression profiles at the individual cell level, which reveals inter-cellular heterogeneity. In population studies, comparing single-cell data from different samples or conditions (e.g., diseased vs. healthy) is used to identify key cell subpopulations and molecular mechanisms. Although single-cell data is often analyzed at the cell level, sample-level comparisons (e.g., across cohorts or time points) is equally important.
+
+The GloScope method addresses this by modeling the entire cell population of each sample as a single probability distribution. Specifically, GloScope fits a Gaussian Mixture Model (GMM) to the cell distribution for each sample in a low-dimensional embedding space. It then quantifies the differences between samples by calculating the KL-divergence between these probability densities. This makes the GloScope method well suited for sample-level comparisons and batch effect evaluation.
+
+However, a central challenge in interpreting GloScope's results arises from technical batch effects, which are common in single-cell RNA sequencing. To address this ambiguity, this project aims to systematically investigate whether the Gaussian Mixture Model (GMM) itself offers a way to deconstruct these sources of divergence. In theory, if its mixture components are interpreted as distinct cell types, the model parameter π would correspond to the cell composition, while μ (the mean) would represent the location of the cell types and Σ (the covariance) would capture their expression variability and shape.
+
+To this end, we conducted an in-depth diagnostic analysis of the GMM components based on the GloScope method using an HIV-PBMC (peripheral blood mononuclear cell) dataset. However, our analysis ultimately shows that the GMM components prioritize fitting the overall density of the data. As a result, their correspondence with biologically defined cell types is weak, and the component-to-cell-type mapping is not consistent across different samples.
+
+---
+
+# Methodology
+
+## Modeling Cell Distributions with Gaussian Mixture Models (GMMs)
+
+To represent the cell distribution within each sample, we model its low-dimensional embedding with a Gaussian Mixture Model (GMM), which assumes the data is generated from a weighted sum of k multivariate Gaussian distributions. For a single sample, this allows its probability density function f(x) to be expressed as:
+
+$$f(x) = \sum_{k=1}^{K} \pi_k \mathcal{N}(x | \mu_k, \Sigma_k)$$
+
+where the model parameters are:
+- k: The number of Gaussian components (i.e., clusters) in the model.
+- π_k: The mixture proportion, representing the fraction of cells belonging to component k.
+- μ_k: The mean vector, representing the center of component k in the low-dimensional space.
+- Σ_k: The covariance matrix, which describes the shape and spread of component k.
+
+```{r data_loading}
+# Load Seurat object containing all samples
+seurat_object <- readRDS(here::here("data", "processed_data", "default_seurat.rds"))
+
+# Display dataset overview
+cat("Dataset Overview:\n")
+cat("Total cells:", ncol(seurat_object), "\n")
+cat("Total genes:", nrow(seurat_object), "\n")
+cat("Samples:", length(unique(seurat_object$sample)), "\n")
+cat("Patients:", length(unique(seurat_object$patient)), "\n")
+cat("Time points:", length(unique(seurat_object$TimePoint)), "\n")
+
+# Show sample composition
+sample_summary <- seurat_object@meta.data %>%
+  group_by(patient, TimePoint) %>%
+  summarise(cell_count = n(), .groups = "drop") %>%
+  arrange(patient, TimePoint)
+
+print(sample_summary)
+```
+
+---
+
+# Results
+
+## Baseline Results Using GloScope's Default Parameters
+
+We first ran the GloScope analysis on the HIV-PBMC dataset using the default parameters (k-range of 1-9 for the GMM) to establish a baseline result. This provides a standard application of the method, yielding a sample-level distance matrix that quantifies the overall distributional differences between each pair of samples.
+
+The results are visualized as a heatmap of the pairwise KL-divergences (**Figure 1: GloScope Divergence Heatmap**) and a corresponding two-dimensional projection using multidimensional scaling (MDS) (**Figure 2: MDS Plot of GloScope Divergences**). To investigate potential patterns, we encoded the clinical metadata directly into the visualization: each point is colored by patient and given a unique shape corresponding to its time point.
+
+```{r baseline_analysis_figure1_2}
+# Generate baseline results - Figure 1 (Heatmap) and Figure 2 (MDS Plot)
+dataset_name <- "HIV_PBMC"
+methods <- c("defaultGMM")
+metadata_cols <- c("sample", "patient", "TimePoint")
+
+# Create sample metadata dataframe
+sample_id_col <- metadata_cols[1]
+all_req_cols <- unique(c(metadata_cols, "patient", "TimePoint"))
+all_metadata <- seurat_object@meta.data
+unique_metadata <- all_metadata[!duplicated(all_metadata[[sample_id_col]]), ]
+metadata_df <- unique_metadata[, all_req_cols]
+rownames(metadata_df) <- metadata_df[[sample_id_col]]
+
+# Load distance matrix for 1-9k range (baseline)
+dist_mat_file <- here::here("data", "gloscope_results", "defaultGMM_1-9k_distMat.rds")
+dist_mat <- readRDS(dist_mat_file)
+
+# FIGURE 1: GloScope Divergence Heatmap
+group_id_col <- "patient"
+ordered_samples <- metadata_df[order(metadata_df[[group_id_col]]), "sample"]
+dist_mat_ordered <- dist_mat[ordered_samples, ordered_samples]
+
+# Display baseline heatmap (Figure 1)
+pheatmap(dist_mat_ordered,
+         color = viridis(100),
+         main = "Figure 1: GloScope Divergence Heatmap",
+         show_rownames = TRUE,
+         show_colnames = TRUE,
+         cluster_rows = FALSE,
+         cluster_cols = FALSE)
+
+# FIGURE 2: MDS Plot of GloScope Divergences
+mds_result <- plotMDS(dist_mat = dist_mat,
+                     metadata_df = metadata_df,
+                     sample_id = "sample",
+                     color_by = "patient",
+                     shape_by = "TimePoint",
+                     k = 2)
+
+# Customize baseline MDS plot (Figure 2)
+baseline_mds_plot <- mds_result$plot +
+  ggtitle("Figure 2: MDS Plot of GloScope Divergences") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 14, face = "bold")) +
+  scale_color_manual(name = "Patient", 
+                    values = c("P1" = "#1f77b4", "P2" = "#ff7f0e", 
+                              "P3" = "#2ca02c", "P4" = "#d62728")) +
+  scale_shape_manual(name = "Time Point", 
+                    values = c("0 Weeks" = 16, "1 Week" = 17, "1 Year" = 15,
+                              "2 Weeks" = 3, "3 Weeks" = 4, "4 Weeks" = 8,
+                              "6 Months" = 18, "Pre-Infection" = 5))
+
+print(baseline_mds_plot)
+```
+
+Despite this detailed mapping, a key observation is the lack of interpretable structure. Samples from the same patient (i.e., same color) do not systematically cluster together, nor do samples from the same time point (i.e., same shape) form distinct groups. This ambiguity in the baseline results motivates our deeper diagnostic analysis of the underlying GMMs.
+
+## Initial Diagnostics Reveal GMM Inconsistencies
+
+Motivated by our goal to decompose these overall divergences, we next performed an in-depth diagnostic of the underlying GMMs that generate these distances. As a first step toward investigating the "matching problem," we diagnosed the underlying GMMs fitted with the default parameters.
+
+```{r gmm_diagnostics_default}
+# Analyze GMM parameter selection for default range (1-9k)
+# We'll use the available 1-9k data to generate actual statistics
+
+# Function to analyze GMM model selection from fitted models or parameter files
+analyze_gmm_selection <- function(fitted_models_file = NULL, run_name = NULL) {
+  # Try fitted models file first
+  if (!is.null(fitted_models_file) && file.exists(fitted_models_file)) {
+    fitted_models <- readRDS(fitted_models_file)
+    
+    # Extract model statistics
+    model_stats <- list()
+    for (sample_name in names(fitted_models)) {
+      if (!is.null(fitted_models[[sample_name]])) {
+        model_stats[[sample_name]] <- list(
+          optimal_k = fitted_models[[sample_name]]$G,
+          optimal_model = fitted_models[[sample_name]]$modelName
+        )
+      }
+    }
+    
+    if (length(model_stats) > 0) {
+      k_values <- sapply(model_stats, function(x) x$optimal_k)
+      model_names <- sapply(model_stats, function(x) x$optimal_model)
+      
+      return(list(
+        k_values = k_values,
+        model_names = model_names,
+        n_samples = length(model_stats)
+      ))
+    }
+  }
+  
+  # Try individual parameter files if fitted models not available
+  if (!is.null(run_name)) {
+    param_dir <- here::here("data", "gloscope_results", run_name)
+    if (dir.exists(param_dir)) {
+      param_files <- list.files(param_dir, pattern = "gmm_params_.*\\.rds", full.names = TRUE)
+      
+      if (length(param_files) > 0) {
+        model_stats <- list()
+        
+        for (param_file in param_files) {
+          tryCatch({
+            params <- readRDS(param_file)
+            sample_name <- gsub(".*gmm_params_(.*?)_defaultGMM.*", "\\1", basename(param_file))
+            
+            # Extract k and model name from parameters
+            if (!is.null(params$mu)) {
+              k_val <- ncol(params$mu)
+            } else {
+              k_val <- NA
+            }
+            
+            model_name <- params$modelName %||% "Unknown"
+            
+            model_stats[[sample_name]] <- list(
+              optimal_k = k_val,
+              optimal_model = model_name
+            )
+          }, error = function(e) {
+            cat("Warning: Could not load", basename(param_file), "\n")
+          })
+        }
+        
+        if (length(model_stats) > 0) {
+          k_values <- sapply(model_stats, function(x) x$optimal_k)
+          model_names <- sapply(model_stats, function(x) x$optimal_model)
+          
+          # Remove NA values
+          valid_indices <- !is.na(k_values) & !is.na(model_names)
+          k_values <- k_values[valid_indices]
+          model_names <- model_names[valid_indices]
+          
+          if (length(k_values) > 0) {
+            return(list(
+              k_values = k_values,
+              model_names = model_names,
+              n_samples = length(k_values)
+            ))
+          }
+        }
+      }
+    }
+  }
+  
+  return(NULL)
+}
+
+# Try to load and analyze 1-9k data (try fitted models first, then parameter files)
+default_models_file <- here::here("data", "gloscope_results", "gmm_fitted_models_1-9k.rds")
+default_analysis <- analyze_gmm_selection(fitted_models_file = default_models_file, run_name = "1-9k")
+
+# Generate Table 1 from actual data
+cat("Table 1: GMM Parameter Selection under Default Settings (k from 1 to 9)\n")
+cat("=================================================================\n")
+cat("Optimal Covariance Model Distribution:\n")
+
+model_counts <- table(default_analysis$model_names)
+for (model in names(model_counts)) {
+  percentage <- round(100 * model_counts[model] / default_analysis$n_samples, 1)
+  cat(sprintf("  %s: %d samples (%.1f%%)\n", model, model_counts[model], percentage))
+}
+
+cat("\nOptimal k Value Distribution:\n")
+k_counts <- table(default_analysis$k_values)
+for (k in sort(as.numeric(names(k_counts)))) {
+  percentage <- round(100 * k_counts[as.character(k)] / default_analysis$n_samples, 1)
+  ceiling_note <- if (k == max(as.numeric(names(k_counts)))) " <- POTENTIAL CEILING EFFECT" else ""
+  cat(sprintf("  k=%d: %d samples (%.1f%%)%s\n", k, k_counts[as.character(k)], percentage, ceiling_note))
+}
+
+# Analyze for issues
+max_k <- max(as.numeric(names(k_counts)))
+ceiling_samples <- k_counts[as.character(max_k)]
+ceiling_pct <- round(100 * ceiling_samples / default_analysis$n_samples, 1)
+
+cat("\nKey Issues Identified:\n")
+cat(sprintf("1. CEILING EFFECT: %.1f%% of samples selected k=%d (maximum allowed)\n", ceiling_pct, max_k))
+cat("2. MODEL INCONSISTENCY:", if(length(model_counts) > 1) "Mixed covariance structures across samples" else "All samples use same model", "\n")
+cat("3. These issues complicate cross-sample GMM component comparisons\n")
+```
+
+This initial summary revealed two issues that complicate cross-sample comparisons: First, we observed evidence of potential model underfitting, highlighted by a "ceiling effect" where 60% of the samples (18 out of 30) selected k=9, the maximum value in the allowed search range. This strongly suggests that the preset k-range was too restrictive to capture the true complexity of the data. Second, the analysis showed a lack of model consistency: while 70% of samples selected the VVE covariance model as optimal, the remaining samples converged on other structures (EVE or VVV).
+
+## Expanding the Parameter Search Leads to Model Convergence
+
+To address the issues of underfitting and inconsistency identified in our initial diagnostics, we expanded the search range for the number of components from 6 to 20. The lower bound was set to 6 because our initial analysis showed that no sample selected an optimal k value less than 6 under the default settings.
+
+```{r gmm_diagnostics_expanded}
+# Load fitted models for expanded range (6-20k) and analyze parameter selection
+expanded_models_file <- here::here("data", "gloscope_results", "gmm_fitted_models_6-20k.rds")
+expanded_analysis <- analyze_gmm_selection(fitted_models_file = expanded_models_file, run_name = "6-20k")
+
+# Generate Table 2 from actual data
+cat("Table 2: GMM Parameter Selection under Expanded Settings (k from 6 to 20)\n")
+cat("=====================================================================\n")
+cat("Optimal Covariance Model Distribution:\n")
+
+model_counts <- table(expanded_analysis$model_names)
+for (model in names(model_counts)) {
+  percentage <- round(100 * model_counts[model] / expanded_analysis$n_samples, 1)
+  emphasis <- if (percentage == 100) " <- PERFECT CONSISTENCY" else ""
+  cat(sprintf("  %s: %d samples (%.1f%%)%s\n", model, model_counts[model], percentage, emphasis))
+}
+
+cat("\nOptimal k Value Distribution:\n")
+k_counts <- table(expanded_analysis$k_values)
+median_k <- median(expanded_analysis$k_values, na.rm = TRUE)
+cat(sprintf("  Median k = %d\n", median_k))
+for (k in sort(as.numeric(names(k_counts)))) {
+  cat(sprintf("  k=%d: %d samples\n", k, k_counts[as.character(k)]))
+}
+
+# Compare with default analysis
+default_median <- median(default_analysis$k_values, na.rm = TRUE)
+
+cat("\nKey Improvements:\n")
+cat(sprintf("1. CEILING EFFECT ELIMINATED: Median k increased from %d to %d\n", default_median, median_k))
+
+if (length(model_counts) == 1) {
+  cat("2. MODEL CONSISTENCY ACHIEVED: All samples now select", names(model_counts)[1], "covariance structure\n")
+} else {
+  cat("2. IMPROVED MODEL CONSISTENCY: Reduced model type variation\n")
+}
+cat("3. This provides a consistent framework for cross-sample comparisons\n")
+```
+
+As shown in the expanded analysis, this adjustment had two significant effects. First, the median optimal k across all samples increased from 9 to 14, confirming that the initial range was too restrictive. Second, and more importantly, this change led to a consistent choice of covariance structure: all 30 samples (100%) selected the VVE model as optimal.
+
+The reason for this convergence is illustrated by the Bayesian Information Criterion (BIC) curves shown in **Figure 3: BIC Curves for Model Selection**.
+
+```{r bic_curves_figure3}
+# FIGURE 3: BIC Curves for Model Selection Across an Expanded k-Range
+bic_results <- quick_bic_analysis(
+  dataset_name = "HIV_PBMC",
+  run_name = "6-20k"
+)
+
+cat("Figure 3: BIC Curves for Model Selection Across an Expanded k-Range\n")
+cat("This plot shows the BIC values (Y-axis, higher is better) for different\n")
+cat("covariance models across the expanded range of component numbers (k, X-axis)\n")
+cat("for six representative samples. The VVE model consistently emerges as the\n")
+cat("optimal choice in the higher k-range for all samples.\n")
+```
+
+When the search space for k is sufficiently large, the BIC value for the VVE model consistently surpasses those of the other models. In contrast, within the original, lower k-range, the optimal model choice was often ambiguous, leading to the inconsistency we previously observed. Achieving a uniform model choice is a critical step, as it removes a key technical confounder and provides a consistent framework for comparing GMM components across all samples.
+
+## GloScope's Global Divergence is Robust to GMM Parameterization
+
+Given the significant changes in the underlying GMMs described above—namely, a higher number of components and a uniform covariance structure—we next assessed the impact of these changes on the final GloScope output. To do this, we compared the MDS plots of the sample divergence matrices generated with the default (k from 1 to 9) and the expanded (k from 6 to 20) parameter ranges.
+
+```{r mds_comparison_figure4}
+# FIGURE 4: Comparison of MDS Plots Before and After GMM Refitting
+# Load enhanced distance matrix for 6-20k range
+dist_mat_file_enhanced <- here::here("data", "gloscope_results", "defaultGMM_6-20k_distMat.rds")
+dist_mat_enhanced <- readRDS(dist_mat_file_enhanced)
+
+# Generate enhanced MDS plot
+mds_result_enhanced <- plotMDS(dist_mat = dist_mat_enhanced,
+                              metadata_df = metadata_df,
+                              sample_id = "sample",
+                              color_by = "patient",
+                              shape_by = "TimePoint",
+                              k = 2)
+
+# Customize enhanced MDS plot
+enhanced_mds_plot <- mds_result_enhanced$plot +
+  ggtitle("Expanded K Range: 6-20") +
+  theme_bw() +
+  theme(plot.title = element_text(hjust = 0.5, size = 12, face = "bold"),
+        legend.position = "none") +
+  scale_color_manual(name = "Patient", 
+                    values = c("P1" = "#1f77b4", "P2" = "#ff7f0e", 
+                              "P3" = "#2ca02c", "P4" = "#d62728")) +
+  scale_shape_manual(name = "Time Point", 
+                    values = c("0 Weeks" = 16, "1 Week" = 17, "1 Year" = 15,
+                              "2 Weeks" = 3, "3 Weeks" = 4, "4 Weeks" = 8,
+                              "6 Months" = 18, "Pre-Infection" = 5))
+
+# Create side-by-side comparison (Figure 4)
+comparison_plot <- grid.arrange(
+  baseline_mds_plot + ggtitle("Default K Range: 1-9") + 
+    theme(legend.position = "none", plot.title = element_text(size = 12)),
+  enhanced_mds_plot,
+  ncol = 2,
+  top = "Figure 4: Comparison of MDS Plots Before and After GMM Refitting"
+)
+```
+
+Unexpectedly, the global arrangement of samples in the MDS plots remained highly consistent despite the substantial refitting of the underlying components. This finding of robustness suggests that GloScope's KL-divergence, which integrates over the entire probability density, is more sensitive to the overall distributional shape of a sample than to the specific number or configuration of its underlying GMM components. This supports our central thesis: individual GMM components should not be over-interpreted as consistent, directly comparable biological entities.
+
+## Visualization Confirms the Complexity of the "Matching Problem"
+
+To visually interrogate the severity of the "matching problem," we analyzed the GMM components from the 6-month time point across all four patients. We first visualized the GMM component centers (μ vectors), overlaid as stars on the cell distributions in the shared PCA space (**Figure 5: PCA Visualization of GMM Components and Cell Types**).
+
+```{r pca_visualization_figure5}
+# FIGURE 5: PCA Visualization of GMM Components and Cell Types
+dataset_name <- "HIV_PBMC"
+run_name <- "6-20k"
+
+# Load sample metadata for 6-20k range
+sample_metadata <- load_sample_metadata(dataset_name, run_name)
+
+# Filter for 6 Months timepoint
+timepoint_samples <- sample_metadata %>%
+  filter(timepoint_clean == "6  Months")
+
+cat("Creating PCA visualization for 6 Months with", nrow(timepoint_samples), "samples\n")
+
+# Load data for all samples in 6 Months timepoint
+all_pc_data <- data.frame()
+all_mu_data <- data.frame()
+
+for (i in 1:nrow(timepoint_samples)) {
+  sample_id <- timepoint_samples$sample_id[i]
+  patient <- timepoint_samples$patient[i]
+  k_comp <- timepoint_samples$k_components[i]
+  
+  # Load PC data
+  pc_data <- load_sample_pca_data(dataset_name, sample_id, run_name)
+  if (!is.null(pc_data)) {
+    pc_data$patient <- patient
+    pc_data$k_components <- k_comp
+    all_pc_data <- rbind(all_pc_data, pc_data)
+  }
+  
+  # Load mu vectors
+  mu_data <- load_sample_mu_vectors(dataset_name, sample_id, run_name)
+  if (!is.null(mu_data)) {
+    mu_data$patient <- patient
+    mu_data$k_components <- k_comp
+    mu_data$component_id <- paste0(sample_id, "_", mu_data$component)
+    all_mu_data <- rbind(all_mu_data, mu_data)
+  }
+}
+
+# Define highlighted components (ideal B-cell block: P1_C4, P2_C1, P4_C1)
+highlighted_components <- c(
+  "P1_6 Months_C4",
+  "P2_6 Months_C1", 
+  "P4_6 Months_C1"
+)
+
+# Add highlighting flag
+all_mu_data$is_highlighted <- all_mu_data$component_id %in% highlighted_components
+
+# Get cell type colors
+cell_type_colors <- get_cell_type_colors(dataset_name)
+
+# Split mu data
+mu_normal <- all_mu_data[!all_mu_data$is_highlighted, ]
+mu_highlighted <- all_mu_data[all_mu_data$is_highlighted, ]
+
+# Create PCA plot with highlighted components (Figure 5)
+pca_plot <- ggplot() +
+  # Cell data as background points
+  geom_point(data = all_pc_data,
+             aes(x = PC_1, y = PC_2, color = cell_type),
+             alpha = 0.6, size = 0.5) +
+  scale_color_manual(values = cell_type_colors, name = "Cell Type") +
+  # Normal GMM mu vectors as black stars
+  geom_point(data = mu_normal,
+             aes(x = PC_1, y = PC_2),
+             color = "black", shape = 8, size = 3, stroke = 1.5) +
+  # Highlighted GMM mu vectors as red stars
+  geom_point(data = mu_highlighted,
+             aes(x = PC_1, y = PC_2),
+             color = "red", shape = 8, size = 4, stroke = 2) +
+  # Facet by patient
+  facet_wrap(~ paste0(patient, " (K=", k_components, ")"),
+             scales = "free", ncol = 2) +
+  labs(
+    title = "Figure 5: PCA Visualization of GMM Components and Cell Types",
+    subtitle = "Black ★ = GMM components, Red ★ = ideal B-cell components (P1_C4, P2_C1, P4_C1)",
+    x = "PC_1",
+    y = "PC_2"
+  ) +
+  theme_bw() +
+  theme(
+    plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+    plot.subtitle = element_text(size = 11, hjust = 0.5),
+    strip.text = element_text(size = 10, face = "bold"),
+    legend.position = "bottom"
+  ) +
+  guides(color = guide_legend(override.aes = list(size = 2, alpha = 1)))
+
+print(pca_plot)
+
+cat("\nFigure 5 Analysis:\n")
+cat("- IDEAL CASE: Red stars (P1_C4, P2_C1, P4_C1) show one-to-one B-cell correspondence\n")
+cat("- FRAGMENTATION: Patient 4's monocytes split into ~7 separate GMM components\n")
+cat("- MISSING CORRESPONDENCE: Patient 3 lacks distinct B-cell component\n")
+cat("- Total components:", nrow(all_mu_data), "| Highlighted:", nrow(mu_highlighted), "\n")
+```
+
+To create a biological reference for comparison, we also established a set of global "cell type anchors." These anchors are defined as the centroid for each major annotated cell type, calculated by taking the mean of the PCA coordinates of all cells of that type from all samples combined. A heatmap of the Euclidean distances between all component centers and these anchors reveals the complexity of their relationships (**Figure 6: Heatmap of Distances Between GMM Component Centers**).
+
+```{r distance_heatmap_figure6}
+# FIGURE 6: Heatmap of Distances Between GMM Component Centers
+TARGET_TIMEPOINT <- "6 Months"
+
+# Load metadata for unified analysis
+sample_metadata_unified <- load_sample_metadata_unified(dataset_name = "HIV_PBMC", run_name = "6-20k")
+
+# Create unified mu matrix with anchors (adapted from util functions)
+create_unified_mu_matrix_inline <- function(dataset_name, timepoint_name, sample_metadata, run_name = "6-20k", use_pcs = 10) {
+  # Get samples for this timepoint
+  timepoint_samples <- sample_metadata %>%
+    filter(timepoint_clean == timepoint_name)
+    
+  if (nrow(timepoint_samples) == 0) {
+    warning("No samples found for timepoint: ", timepoint_name)
+    return(NULL)
+  }
+
+  # Initialize containers
+  mu_list <- list()
+  sample_info_list <- list()
+
+  # Load mu vectors for each sample
+  for (i in 1:nrow(timepoint_samples)) {
+    sample_id <- timepoint_samples$sample_id[i]
+    patient <- timepoint_samples$patient[i]
+    k_comp <- timepoint_samples$k_components[i]
+
+    # Load GMM parameters
+    param_file <- here::here("data", "gloscope_results", run_name,
+                             paste0("gmm_params_", sample_id, "_defaultGMM_", run_name, ".rds"))
+
+    if (file.exists(param_file)) {
+      tryCatch({
+        params <- readRDS(param_file)
+
+        if (!is.null(params$mu)) {
+          mu_matrix <- params$mu
+
+          # Use specified number of PCs
+          if (nrow(mu_matrix) > use_pcs) {
+            mu_matrix <- mu_matrix[1:use_pcs, ]
+          }
+
+          # Add each component to the list
+          for (comp in 1:ncol(mu_matrix)) {
+            unique_id <- paste0(sample_id, "_C", comp)
+            mu_list[[unique_id]] <- mu_matrix[, comp]
+
+            sample_info_list[[unique_id]] <- data.frame(
+              unique_id = unique_id,
+              sample_id = sample_id,
+              component = comp,
+              patient = patient,
+              timepoint = timepoint_name,
+              is_anchor = FALSE,
+              stringsAsFactors = FALSE
+            )
+          }
+        }
+      }, error = function(e) {
+        cat("Warning: Could not load mu vectors for", sample_id, "\n")
+      })
+    }
+  }
+
+  if (length(mu_list) == 0) {
+    cat("No valid mu vectors found for", timepoint_name, "\n")
+    return(NULL)
+  }
+
+  # Load cell-type anchors
+  seurat_file <- here::here("data", "processed_data", "default_seurat.rds")
+  if (file.exists(seurat_file)) {
+    seurat_obj <- readRDS(seurat_file)
+    
+    # Extract PCA coordinates and metadata
+    pca_coords <- seurat_obj[["pca"]]@cell.embeddings[, 1:use_pcs]
+    colnames(pca_coords) <- paste0("PC", 1:use_pcs)
+    
+    metadata <- seurat_obj@meta.data
+    
+    pc_data <- as.data.frame(pca_coords) %>%
+      bind_cols(metadata)
+    
+    # Calculate anchors (mean PC coordinates per cell type)
+    anchors <- pc_data %>%
+      group_by(cell_type) %>%
+      summarise(across(paste0("PC", 1:use_pcs), ~ mean(.x, na.rm = TRUE)), .groups = 'drop')
+    
+    # Add anchors to mu_list
+    for (a in 1:nrow(anchors)) {
+      celltype <- anchors$cell_type[a]
+      anchor_id <- paste0("CellType-", celltype)
+      mu_list[[anchor_id]] <- as.numeric(anchors[a, paste0("PC", 1:use_pcs)])
+
+      sample_info_list[[anchor_id]] <- data.frame(
+        unique_id = anchor_id,
+        sample_id = anchor_id,
+        component = 0,
+        patient = "Anchor",
+        timepoint = timepoint_name,
+        is_anchor = TRUE,
+        stringsAsFactors = FALSE
+      )
+    }
+  }
+
+  # Convert to matrix
+  mu_matrix <- do.call(rbind, mu_list)
+  sample_info_df <- do.call(rbind, sample_info_list)
+  rownames(mu_matrix) <- sample_info_df$unique_id
+
+  return(list(
+    mu_matrix = mu_matrix,
+    sample_info = sample_info_df
+  ))
+}
+
+# Create unified mu matrix with anchors
+mu_data <- create_unified_mu_matrix_inline("HIV_PBMC", TARGET_TIMEPOINT, sample_metadata_unified, "6-20k", 10)
+
+if (!is.null(mu_data)) {
+  # Calculate Euclidean distance matrix
+  dist_matrix <- as.matrix(dist(mu_data$mu_matrix, method = "euclidean"))
+  
+  # Create annotation dataframe
+  sample_info <- mu_data$sample_info
+  
+  annotation_df <- data.frame(
+    Sample = sample_info$sample_id,
+    Type = ifelse(sample_info$is_anchor, "Anchor", "μ-vector"),
+    row.names = sample_info$unique_id
+  )
+  
+  # Create color scheme
+  unique_samples <- unique(sample_info$sample_id[!sample_info$is_anchor])
+  
+  if (length(unique_samples) <= 8) {
+    sample_colors <- RColorBrewer::brewer.pal(max(3, length(unique_samples)), "Set2")
+  } else {
+    sample_colors <- rainbow(length(unique_samples))
+  }
+  names(sample_colors) <- unique_samples
+  
+  # Add anchor colors (black for all anchors)
+  anchor_ids <- unique(sample_info$sample_id[sample_info$is_anchor])
+  if (length(anchor_ids) > 0) {
+    anchor_colors <- rep("#000000", length(anchor_ids))
+    names(anchor_colors) <- anchor_ids
+    sample_colors <- c(sample_colors, anchor_colors)
+  }
+  
+  # Type colors
+  type_colors <- c("μ-vector" = "#E31A1C", "Anchor" = "#1F78B4")
+  
+  annotation_colors <- list(
+    Sample = sample_colors,
+    Type = type_colors
+  )
+  
+  # Count samples for subtitle
+  n_samples <- length(unique(mu_data$sample_info$sample_id[!mu_data$sample_info$is_anchor]))
+  
+  # Display heatmap directly (Figure 6)
+  pheatmap(
+    dist_matrix,
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    annotation_row = annotation_df,
+    annotation_col = annotation_df,
+    annotation_colors = annotation_colors,
+    main = paste0("Figure 6: Component and Anchor Euclidean Distance Heatmap\n",
+                  TARGET_TIMEPOINT, " (", n_samples, " samples + anchors)"),
+    fontsize = 10,
+    fontsize_row = 8,
+    fontsize_col = 8,
+    show_rownames = TRUE,
+    show_colnames = TRUE,
+    angle_col = 45,
+    cellwidth = 12,
+    cellheight = 12,
+    color = colorRampPalette(c("blue", "white", "red"))(100)
+  )
+}
+  
+cat("\nFigure 6: Heatmap of Distances Between GMM Component Centers\n")
+cat("============================================================\n")
+cat("This heatmap shows Euclidean distances between GMM components from all\n")
+cat("four patients at 6-months timepoint and their distances to global cell\n")
+cat("type anchors (denoted as CellType-*).\n\n")
+
+cat("Key Insights:\n")
+cat("- IDEAL BLOCK: B-cell components cluster near B-cell anchor\n")
+cat("- AMBIGUOUS COMPONENTS: Many show intermediate distances to multiple anchors\n")
+cat("- MANY-TO-MANY RELATIONSHIPS: Complex component-to-cell-type mappings\n")
+```
+
+To first evaluate the best-case scenario for the matching problem, we identified a block of components—specifically P1_C4, P2_C1, and P4_C1—that showed strong correspondence to the B cell anchor across multiple patients. In the PCA visualization, we highlighted these components as red stars. The highlighted components from Patient 1, 2, and 4 are all precisely located within the center of their respective B cell populations. This demonstrates an ideal one-to-one mapping, where a single GMM component successfully represents the same biological cell type across different samples.
+
+However, this ideal one-to-one mapping is the rare exception. The more common "many-to-many" relationship is clearly revealed when we examine components with ambiguous biological identity. This complexity is further illustrated by the GMM's tendency to fracture a single, homogeneous cell population into multiple components. A clear illustration is found in Patient 4, where the dense population of monocytes is modeled by no fewer than seven separate GMM components. This placement of numerous components reveals the GMM's primary goal: it is not to identify discrete biological clusters, but rather to achieve a better statistical fit to the data's overall density.
+
+# Conclusion
+
+Our diagnostic analysis yielded two primary findings. First, GloScope's method of comparing samples via the KL-divergence of their GMM densities is remarkably robust. The final sample-level comparisons are largely insensitive to significant changes in the underlying GMM parameterization. Second, this robustness arises precisely because the individual GMM components do not function as consistent proxies for discrete biological cell types. Our investigation into the "matching problem" demonstrated that when fitted independently, GMM components exhibit a complex, many-to-many relationship with annotated cell types, and their number and location are inconsistent across samples. This confirms they are flexible statistical constructs whose primary goal is to model the overall density, not to act as consistent biological entities.
+
+Consequently, within the current framework, using post-hoc mapping of GMM components to perform a comparison based solely on expression is not feasible. Because the GMM components are not consistent across samples, we cannot reliably use their parameters to disentangle changes in cell composition from changes in expression. This provides a clear direction for future methodological improvements. Instead of attempting to post-process inconsistent GMM components, future models should likely aim to develop novel joint-estimation methods that can enforce component correspondence across samples directly at the modeling stage.
